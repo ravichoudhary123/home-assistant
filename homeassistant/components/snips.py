@@ -19,6 +19,15 @@ CONF_ACTION = 'action'
 
 INTENT_TOPIC = 'hermes/nlu/intentParsed'
 
+# Response keys
+INTENT_KEY = 'intent'
+INPUT_KEY = 'input'
+INTENT_NAME_KEY = 'intentName'
+SLOTS_KEY = 'slots'
+SLOT_NAME_KEY = 'slotName'
+VALUE_KEY = 'value'
+KIND_KEY = 'kind'
+
 LOGGER = logging.getLogger(__name__)
 
 CONFIG_SCHEMA = vol.Schema({
@@ -32,15 +41,15 @@ CONFIG_SCHEMA = vol.Schema({
 }, extra=vol.ALLOW_EXTRA)
 
 INTENT_SCHEMA = vol.Schema({
-    vol.Required('input'): str,
-    vol.Required('intent'): {
-        vol.Required('intentName'): str
+    vol.Required(INPUT_KEY): str,
+    vol.Required(INTENT_KEY): {
+        vol.Required('%s' % INTENT_NAME_KEY): str
     },
-    vol.Optional('slots'): [{
-        vol.Required('slotName'): str,
-        vol.Required('value'): {
-            vol.Required('kind'): str,
-            vol.Required('value'): cv.match_all
+    vol.Optional(SLOTS_KEY): [{
+        vol.Required(SLOT_NAME_KEY): str,
+        vol.Required(VALUE_KEY): {
+            vol.Required(KIND_KEY): str,
+            vol.Required(VALUE_KEY): cv.match_all
         }
     }]
 }, extra=vol.ALLOW_EXTRA)
@@ -50,72 +59,69 @@ INTENT_SCHEMA = vol.Schema({
 def async_setup(hass, config):
     """Activate Snips component."""
     mqtt = loader.get_component('mqtt')
-    intents = config[DOMAIN].get(CONF_INTENTS, {})
-    handler = IntentHandler(hass, intents)
+    intents = config[DOMAIN].get(CONF_INTENTS, dict())
+    attached_intents = attach_intents(hass, intents)
 
     @asyncio.coroutine
     def message_received(topic, payload, qos):
         """Handle new messages on MQTT."""
         LOGGER.debug("New intent: %s", payload)
-        yield from handler.handle_intent(payload)
+        yield from handle_intent(payload, attached_intents)
 
     yield from mqtt.async_subscribe(hass, INTENT_TOPIC, message_received)
 
     return True
 
 
-class IntentHandler(object):
-    """Help handling intents."""
+def attach_intents(hass, intents):
+    """Attach hass to the intents"""
+    attached_intents = copy.deepcopy(intents)
+    template.attach(hass, attached_intents)
 
-    def __init__(self, hass, intents):
-        """Initialize the intent handler."""
-        self.hass = hass
-        intents = copy.deepcopy(intents)
-        template.attach(hass, intents)
+    for name, intent in attached_intents.items():
+        if CONF_ACTION in intent:
+            intent[CONF_ACTION] = script.Script(
+                hass, intent[CONF_ACTION], "Snips intent {}".format(name))
 
-        for name, intent in intents.items():
-            if CONF_ACTION in intent:
-                intent[CONF_ACTION] = script.Script(
-                    hass, intent[CONF_ACTION], "Snips intent {}".format(name))
+    return attached_intents
 
-        self.intents = intents
 
-    @asyncio.coroutine
-    def handle_intent(self, payload):
-        """Handle an intent."""
-        try:
-            response = json.loads(payload)
-        except TypeError:
-            LOGGER.error('Received invalid JSON: %s', payload)
-            return
+def handle_intent(payload, intents):
+    """Handle an intent."""
+    try:
+        response = json.loads(payload)
+    except TypeError:
+        LOGGER.error('Received invalid JSON: %s', payload)
+        return
 
-        try:
-            response = INTENT_SCHEMA(response)
-        except vol.Invalid as err:
-            LOGGER.error('Intent has invalid schema: %s. %s', err, response)
-            return
+    try:
+        response = INTENT_SCHEMA(response)
+    except vol.Invalid as err:
+        LOGGER.error('Intent has invalid schema: %s. %s', err, response)
+        return
 
-        intent = response['intent']['intentName'].split('__')[-1]
-        config = self.intents.get(intent)
+    intent = response[INTENT_KEY][INTENT_NAME_KEY].split('__')[-1]
+    config = intents.get(intent)
 
-        if config is None:
-            LOGGER.warning("Received unknown intent %s. %s", intent, response)
-            return
+    if config is None:
+        LOGGER.warning("Received unknown intent %s. %s", intent, response)
+        return
 
-        action = config.get(CONF_ACTION)
+    action = config.get(CONF_ACTION)
 
-        if action is not None:
-            slots = self.parse_slots(response)
-            yield from action.async_run(slots)
+    if action is not None:
+        slots = parse_slots(response)
+        yield from action.async_run(slots)
 
-    def parse_slots(self, response):
-        """Parse the intent slots."""
-        parameters = {}
 
-        for slot in response.get('slots', []):
-            key = slot['slotName']
-            value = slot['value']['value']
-            if value is not None:
-                parameters[key] = value
+def parse_slots(response):
+    """Parse the intent slots."""
+    parameters = dict()
 
-        return parameters
+    for slot in response.get(SLOTS_KEY, []):
+        key = slot[SLOT_NAME_KEY]
+        value = slot[VALUE_KEY][VALUE_KEY]
+        if value is not None:
+            parameters[key] = value
+
+    return parameters
